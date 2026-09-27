@@ -1,0 +1,462 @@
+openapi: 3.1.0
+info:
+  title: Apex Airways Seat Assignment API — Structured Error Schema (AFTER)
+  version: 2.0.0
+  summary: Every error is machine-readable, says whether to retry, and says what to do next.
+  description: |
+    AFTER state for Principle 2 — "Your Error Is an Agent's Next Step."
+
+    Every 4xx and 5xx response uses one `Error` schema with five decision fields:
+
+    | Field         | Answers the agent's question            |
+    |---------------|-----------------------------------------|
+    | `error_code`  | What happened? (stable, matchable)      |
+    | `message`     | How do I explain it to a human?         |
+    | `retryable`   | Should I try the same request again?    |
+    | `retry_after` | If so, how long do I wait?              |
+    | `remediation` | If not, what should I do instead?       |
+
+    Plus `correlation_id` and `request_id` so every failure is traceable.
+
+    `retryable` describes this occurrence, not the code in general. The same
+    `SEAT_UNAVAILABLE` code can be retryable during irregular operations (inventory
+    is being reloaded) and non-retryable when the seat was simply sold.
+
+    Compare with `before.openapi.yaml` in this folder. The two files differ only in
+    error handling; status enums, idempotency, and tracing are identical.
+
+    Apex Airways is a fictional airline used in the talk
+    "Contract-First APIs in the Age of Agents."
+  contact:
+    name: Apex Airways API Platform Team
+    url: https://developer.apex-airways.example
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.apex-airways.example/v2
+security:
+  - agentOAuth: [bookings:write]
+tags:
+  - name: Seats
+    description: View seat maps and assign seats on confirmed bookings.
+
+paths:
+  /bookings/{bookingId}/seat-map:
+    get:
+      operationId: getSeatMap
+      tags: [Seats]
+      summary: List the seats that can be assigned on a booking's flight
+      description: |
+        Returns every seat on the booked flight with its availability for this traveler.
+        Call this to choose a seat before `assignSeat`, or when `assignSeat` fails with
+        `SEAT_UNAVAILABLE` and `retryable: false` — pick an `AVAILABLE` seat from this
+        list and call `assignSeat` again with a new `Idempotency-Key`.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      responses:
+        '200':
+          description: Seat map for the booked flight.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeatMap' }
+        '404': { $ref: '#/components/responses/BookingNotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings/{bookingId}/seat:
+    put:
+      operationId: assignSeat
+      tags: [Seats]
+      summary: Assign a specific seat to a confirmed booking
+      description: |
+        Assigns the requested seat to the traveler on a `CONFIRMED` booking. Replaces any
+        previously assigned seat.
+
+        On failure, read `error_code` and `retryable` — never parse `message`:
+        - `retryable: true` → wait `retry_after` seconds, then repeat the identical
+          request with the same `Idempotency-Key`.
+        - `retryable: false` → do not repeat the request. Follow `remediation`
+          (for `SEAT_UNAVAILABLE`, choose another seat from `getSeatMap`), or escalate
+          to the traveler with `message`.
+
+        This endpoint is idempotent when an `Idempotency-Key` header is provided.
+        Clients should generate a UUID per seat request and reuse it on retry.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SeatAssignmentRequest' }
+            example: { seat: 12C }
+      responses:
+        '200':
+          description: Seat assigned.
+          headers:
+            Idempotency-Key: { $ref: '#/components/headers/Idempotency-Key' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeatAssignment' }
+              example:
+                booking_id: BK-99182
+                seat: 12C
+                status: ASSIGNED
+        '400':
+          description: The request body is invalid. Not retryable without changes.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                badSeat:
+                  summary: Malformed seat identifier
+                  value:
+                    error_code: VALIDATION_FAILED
+                    message: "Seat '12Z' is not a valid seat identifier."
+                    retryable: false
+                    retry_after: null
+                    remediation: Use a seat identifier returned by GET /bookings/BK-99182/seat-map.
+                    details:
+                      - field: seat
+                        issue: Must match ^[0-9]{1,2}[A-K]$
+                    correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                    request_id: 0f8e2b6a-93d1-4e7c-a5b2-6c4d1e9f3a77
+        '404': { $ref: '#/components/responses/BookingNotFound' }
+        '409':
+          description: |
+            The seat cannot be assigned in the booking's current state. Check `error_code`:
+            `SEAT_UNAVAILABLE` or `BOOKING_NOT_CONFIRMED`. `retryable` says whether to retry.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                seatUnavailableIrrops:
+                  summary: IRROPS — inventory reloading, retry shortly (slide 7)
+                  value:
+                    error_code: SEAT_UNAVAILABLE
+                    message: The selected seat is no longer available.
+                    retryable: true
+                    retry_after: 30
+                    remediation: Query /flights?origin=ORD&dest=ATL&flexible=true for available alternatives.
+                    next_action:
+                      method: GET
+                      href: /flights?origin=ORD&dest=ATL&flexible=true
+                    details: []
+                    correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                    request_id: 3b1f7e2d-5a6c-4d8e-b9f0-1c2a3d4e5f60
+                seatSold:
+                  summary: Seat sold to someone else — do not retry (slide 12)
+                  value:
+                    error_code: SEAT_UNAVAILABLE
+                    message: Seat 12C has been assigned to another passenger.
+                    retryable: false
+                    retry_after: null
+                    remediation: Choose an AVAILABLE seat from GET /bookings/BK-99182/seat-map and call assignSeat with a new Idempotency-Key.
+                    next_action:
+                      method: GET
+                      href: /bookings/BK-99182/seat-map
+                    details: []
+                    correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                    request_id: 9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d
+                bookingPending:
+                  summary: Booking still PENDING — wait for CONFIRMED, then retry
+                  value:
+                    error_code: BOOKING_NOT_CONFIRMED
+                    message: Seats can only be assigned once the booking is CONFIRMED.
+                    retryable: true
+                    retry_after: 5
+                    remediation: Poll GET /bookings/BK-99182 until status is CONFIRMED, then retry.
+                    next_action:
+                      method: GET
+                      href: /bookings/BK-99182
+                    details: []
+                    correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                    request_id: 2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+components:
+  securitySchemes:
+    agentOAuth:
+      type: oauth2
+      description: |
+        OAuth 2.1 client credentials. Each agent receives its own client identity,
+        separate from the human traveler, so every call is attributable and revocable.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.apex-airways.example/oauth2/token
+          scopes:
+            bookings:read: Read bookings and seat maps.
+            bookings:write: Create and modify bookings and seats.
+
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      description: The `booking_id` of a booking.
+      schema: { type: string, pattern: '^BK-[0-9]+$' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying this attempt. Reuse the same value on retries.
+      schema: { type: string, format: uuid }
+    CorrelationIdRequest:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Correlation ID of the caller's workflow. If omitted, the server generates one.
+      schema: { type: string, format: uuid }
+    TraceParentRequest:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context `traceparent` header.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Idempotency-Key:
+      description: Echo of the `Idempotency-Key` supplied on the request.
+      schema: { type: string, format: uuid }
+    X-Correlation-ID:
+      description: Shared by every call in one end-to-end workflow. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    X-Request-ID:
+      description: Unique to this single call. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    traceparent:
+      description: W3C Trace Context for this call. Always present.
+      required: true
+      schema: { type: string }
+    Retry-After:
+      description: |
+        Seconds to wait before retrying (RFC 9110). Always equal to the body's
+        `retry_after`, so HTTP-level middleware and the agent agree.
+      required: true
+      schema: { type: integer, minimum: 0 }
+
+  schemas:
+    SeatAssignmentRequest:
+      type: object
+      required: [seat]
+      properties:
+        seat:
+          type: string
+          pattern: '^[0-9]{1,2}[A-K]$'
+          description: Seat identifier from `getSeatMap`, e.g. `12C`.
+
+    SeatAssignment:
+      type: object
+      required: [booking_id, seat, status]
+      properties:
+        booking_id: { type: string }
+        seat: { type: string }
+        status:
+          type: string
+          enum: [ASSIGNED]
+          description: "`ASSIGNED` — the seat is held for this traveler."
+
+    Seat:
+      type: object
+      required: [seat, availability, cabin]
+      properties:
+        seat: { type: string, examples: [5A] }
+        cabin: { type: string, enum: [FIRST, ECONOMY_PLUS, ECONOMY] }
+        availability:
+          type: string
+          enum: [AVAILABLE, OCCUPIED, BLOCKED]
+          description: |
+            - `AVAILABLE` — can be assigned now.
+            - `OCCUPIED` — assigned to another passenger.
+            - `BLOCKED` — held by the airline (crew, weight and balance, accessibility).
+
+    SeatMap:
+      type: object
+      required: [booking_id, seats]
+      properties:
+        booking_id: { type: string }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/Seat' }
+
+    ErrorCode:
+      type: string
+      description: |
+        Stable, machine-readable error identifier. Match on this, never on `message`.
+        Codes are never renamed, removed, or reused. New codes may be added in a minor
+        version, which is why this list is an `x-extensible-enum` rather than a closed
+        `enum`: a consumer that receives a code it does not recognize must fall back to
+        `retryable`, `retry_after`, and `remediation`, which are always present.
+        - `VALIDATION_FAILED` — the request is malformed; see `details`.
+        - `BOOKING_NOT_FOUND` — no booking with that ID is visible to this client.
+        - `BOOKING_NOT_CONFIRMED` — the operation requires a `CONFIRMED` booking.
+        - `SEAT_UNAVAILABLE` — the requested seat cannot be assigned.
+        - `RATE_LIMITED` — too many requests; wait `retry_after` seconds.
+        - `INTERNAL_ERROR` — unexpected server fault; safe to retry with the same Idempotency-Key.
+        - `SERVICE_UNAVAILABLE` — a dependency is down; wait `retry_after` seconds.
+      x-extensible-enum:
+        - VALIDATION_FAILED
+        - BOOKING_NOT_FOUND
+        - BOOKING_NOT_CONFIRMED
+        - SEAT_UNAVAILABLE
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+        - SERVICE_UNAVAILABLE
+
+    ErrorDetail:
+      type: object
+      required: [field, issue]
+      properties:
+        field: { type: string, description: JSON Pointer or property name of the offending input. }
+        issue: { type: string, description: What is wrong with it. }
+
+    NextAction:
+      type: object
+      description: Structured form of `remediation` that an agent can execute without parsing prose.
+      required: [method, href]
+      properties:
+        method: { type: string, enum: [GET, POST, PUT, PATCH] }
+        href: { type: string, format: uri-reference }
+
+    Error:
+      type: object
+      description: |
+        The single error shape for every 4xx and 5xx response in this API.
+        All fields are always present; fields with nothing to say are null or empty.
+      required: [error_code, message, retryable, retry_after, remediation, details, correlation_id, request_id]
+      properties:
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        message:
+          type: string
+          description: Human-readable explanation suitable for logs and for the traveler. Not for matching.
+        retryable:
+          type: boolean
+          description: |
+            True if repeating the identical request (same `Idempotency-Key`) may succeed.
+            False means stop: retrying will fail the same way and only consumes rate limit.
+        retry_after:
+          type: [integer, 'null']
+          minimum: 0
+          description: Seconds to wait before retrying. Null when `retryable` is false.
+        remediation:
+          type: [string, 'null']
+          description: What the caller should do next, in one sentence. Null when there is nothing to suggest.
+        next_action:
+          description: Optional machine-actionable version of `remediation`.
+          $ref: '#/components/schemas/NextAction'
+        details:
+          type: array
+          description: Field-level problems. Empty unless `error_code` is `VALIDATION_FAILED`.
+          items: { $ref: '#/components/schemas/ErrorDetail' }
+        correlation_id:
+          type: string
+          format: uuid
+          description: Same value as the `X-Correlation-ID` response header.
+        request_id:
+          type: string
+          format: uuid
+          description: Same value as the `X-Request-ID` response header.
+
+  responses:
+    BookingNotFound:
+      description: No booking with that ID is visible to this client. Not retryable.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error_code: BOOKING_NOT_FOUND
+            message: No booking BK-99999 exists for this traveler.
+            retryable: false
+            retry_after: null
+            remediation: Verify the booking_id returned by createBooking.
+            details: []
+            correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+            request_id: 5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b
+    RateLimited:
+      description: Rate limit exceeded. Retryable after `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error_code: RATE_LIMITED
+            message: Too many requests for this client. Slow down.
+            retryable: true
+            retry_after: 12
+            remediation: Wait 12 seconds, then retry with the same Idempotency-Key.
+            details: []
+            correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+            request_id: 6f7a8b9c-0d1e-4f2a-9b3c-4d5e6f7a8b9c
+    InternalError:
+      description: Unexpected server fault. Retryable with the same `Idempotency-Key`.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error_code: INTERNAL_ERROR
+            message: An unexpected error occurred. It has been logged.
+            retryable: true
+            retry_after: 2
+            remediation: Retry with the same Idempotency-Key. If it persists, contact support with the correlation_id.
+            details: []
+            correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+            request_id: 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+    ServiceUnavailable:
+      description: A dependency is temporarily down. Retryable after `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error_code: SERVICE_UNAVAILABLE
+            message: Seat inventory is temporarily unavailable.
+            retryable: true
+            retry_after: 30
+            remediation: Wait 30 seconds, then retry with the same Idempotency-Key.
+            details: []
+            correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+            request_id: 8b9c0d1e-2f3a-4b4c-9d5e-6f7a8b9c0d1e

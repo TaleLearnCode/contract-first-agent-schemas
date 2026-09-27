@@ -1,0 +1,450 @@
+openapi: 3.1.0
+info:
+  title: Apex Airways Booking API — Status Enum Pattern (AFTER)
+  version: 2.0.0
+  summary: Deterministic status fields, explicit nullability, and consistent pagination.
+  description: |
+    AFTER state for Principle 1 — "Make the Happy Path Boring."
+
+    Every status field in this contract is a closed enum with a documented meaning
+    for each value. Every field that can be empty is declared nullable and is still
+    always present, so a consumer never has to decide whether a missing key is an
+    error or a valid empty state. Pagination uses one cursor field name everywhere.
+
+    Compare with `before.openapi.yaml` in this folder. The two files differ only in
+    the concerns covered by Principle 1; idempotency, errors, and tracing are already
+    in their agent-ready form so the diff isolates the status pattern.
+
+    Apex Airways is a fictional airline used in the talk
+    "Contract-First APIs in the Age of Agents."
+  contact:
+    name: Apex Airways API Platform Team
+    url: https://developer.apex-airways.example
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.apex-airways.example/v2
+security:
+  - agentOAuth: [bookings:read, bookings:write]
+tags:
+  - name: Flights
+    description: Search available flights.
+  - name: Bookings
+    description: Create bookings and track them to a terminal state.
+
+paths:
+  /flights:
+    get:
+      operationId: searchFlights
+      tags: [Flights]
+      summary: Search for available flights between two airports
+      description: |
+        Returns flights that match the origin, destination, and date. Call this before
+        `createBooking` to obtain a `flight_id`, or after a `SEAT_UNAVAILABLE` error to
+        find alternatives (set `flexible=true` to include nearby dates and airports).
+
+        `search_status` tells you whether the result set is complete. `COMPLETE` means
+        every inventory source answered; `PARTIAL` means at least one source timed out
+        and repeating the search later may return more flights. An empty `results`
+        array with `search_status: COMPLETE` is a valid answer: there are no flights.
+
+        Results are paginated. When `next_cursor` is null there are no more pages;
+        otherwise pass it back as the `cursor` query parameter.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+        - name: origin
+          in: query
+          required: true
+          description: IATA airport code of the departure airport, e.g. `ORD`.
+          schema: { $ref: '#/components/schemas/AirportCode' }
+        - name: dest
+          in: query
+          required: true
+          description: IATA airport code of the arrival airport, e.g. `ATL`.
+          schema: { $ref: '#/components/schemas/AirportCode' }
+        - name: date
+          in: query
+          required: true
+          description: Departure date in the origin airport's local time (ISO 8601).
+          schema: { type: string, format: date }
+        - name: flexible
+          in: query
+          required: false
+          description: When true, include flights one day either side and alternate airports.
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Search executed. Inspect `search_status` to know if results are complete.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightSearchResult' }
+              examples:
+                complete:
+                  summary: All inventory sources answered
+                  value:
+                    search_status: COMPLETE
+                    results:
+                      - flight_id: FL-AX1142-20261005
+                        flight_number: AX1142
+                        origin: ORD
+                        dest: ATL
+                        departs_at: '2026-10-05T07:10:00-05:00'
+                        arrives_at: '2026-10-05T10:02:00-04:00'
+                        seats_remaining: 4
+                        fare_class: Y
+                    next_cursor: null
+                partial:
+                  summary: One source timed out — results may be incomplete
+                  value:
+                    search_status: PARTIAL
+                    results: []
+                    next_cursor: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Request a booking for a flight (asynchronous)
+      description: |
+        Requests a booking for one passenger on one flight. Booking is asynchronous:
+        this call returns `202 Accepted` with a `Booking` whose `status` is `PENDING`
+        (or, rarely, already `CONFIRMED`). A `PENDING` booking is NOT a ticket. Do not
+        tell the traveler they are booked until `status` is `CONFIRMED`.
+
+        While `status` is `PENDING`, poll `getBooking` using the URL in the `Location`
+        header, waiting at least `poll_after_seconds` between calls. `CONFIRMED` and
+        `FAILED` are terminal: stop polling.
+
+        This endpoint is idempotent when an `Idempotency-Key` header is provided.
+        Clients should generate a UUID per booking attempt and reuse it on every retry
+        of that attempt.
+      security:
+        - agentOAuth: [bookings:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+      responses:
+        '202':
+          description: Booking accepted. Poll until `status` is `CONFIRMED` or `FAILED`.
+          headers:
+            Location:
+              description: URL of the booking resource to poll.
+              schema: { type: string, format: uri-reference }
+            Idempotency-Key: { $ref: '#/components/headers/Idempotency-Key' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                pending:
+                  summary: Saturday night — accepted, not yet confirmed
+                  value:
+                    booking_id: BK-99182
+                    status: PENDING
+                    status_updated_at: '2026-10-03T23:41:07Z'
+                    confirmation_number: null
+                    failure_reason: null
+                    poll_after_seconds: 5
+                    flight_id: FL-AX1142-20261005
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings/{bookingId}:
+    get:
+      operationId: getBooking
+      tags: [Bookings]
+      summary: Get the current state of a booking (use for polling)
+      description: |
+        Returns the booking and its current `status`. Use this to poll a booking that
+        `createBooking` returned as `PENDING`. Keep polling while `status` is `PENDING`,
+        waiting `poll_after_seconds` between calls. When `status` becomes `CONFIRMED`,
+        `confirmation_number` is populated and the traveler holds a ticket. When
+        `status` becomes `FAILED`, `failure_reason` explains why and no charge was made.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      responses:
+        '200':
+          description: Current booking state.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                confirmed:
+                  summary: Terminal success — one ticket, one charge
+                  value:
+                    booking_id: BK-99182
+                    status: CONFIRMED
+                    status_updated_at: '2026-10-03T23:41:19Z'
+                    confirmation_number: QX7P2M
+                    failure_reason: null
+                    poll_after_seconds: null
+                    flight_id: FL-AX1142-20261005
+                failed:
+                  summary: Terminal failure — no ticket, no charge
+                  value:
+                    booking_id: BK-99183
+                    status: FAILED
+                    status_updated_at: '2026-10-03T23:42:02Z'
+                    confirmation_number: null
+                    failure_reason: FARE_NO_LONGER_AVAILABLE
+                    poll_after_seconds: null
+                    flight_id: FL-AX1142-20261005
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+components:
+  securitySchemes:
+    agentOAuth:
+      type: oauth2
+      description: |
+        OAuth 2.1 client credentials. Each agent receives its own client identity,
+        separate from the human traveler, so every call is attributable and revocable.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.apex-airways.example/oauth2/token
+          scopes:
+            bookings:read: Search flights and read bookings.
+            bookings:write: Create and modify bookings.
+
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      description: The `booking_id` returned by `createBooking`.
+      schema: { type: string, pattern: '^BK-[0-9]+$' }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous response's `next_cursor`. Omit for the first page.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum items per page.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying this attempt. Reuse the same value on retries.
+      schema: { type: string, format: uuid }
+    CorrelationIdRequest:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Correlation ID of the caller's workflow. If omitted, the server generates one.
+      schema: { type: string, format: uuid }
+    TraceParentRequest:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context `traceparent` header.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Idempotency-Key:
+      description: Echo of the `Idempotency-Key` supplied on the request.
+      schema: { type: string, format: uuid }
+    X-Correlation-ID:
+      description: Shared by every call in one end-to-end workflow. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    X-Request-ID:
+      description: Unique to this single call. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    traceparent:
+      description: W3C Trace Context for this call. Always present.
+      required: true
+      schema: { type: string }
+    Retry-After:
+      description: Seconds to wait before retrying.
+      required: true
+      schema: { type: integer, minimum: 0 }
+
+  schemas:
+    AirportCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      examples: [ORD]
+
+    BookingStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, FAILED]
+      description: |
+        Lifecycle state of a booking. This is a closed set.
+        - `PENDING` — Accepted and in progress. NOT a ticket. Poll `getBooking`.
+        - `CONFIRMED` — Terminal. Ticket issued, payment captured, `confirmation_number` set.
+        - `FAILED` — Terminal. No ticket, no charge. `failure_reason` is set.
+        Adding a value to this enum is a breaking change and ships only in a new major version.
+      x-enum-descriptions:
+        PENDING: Accepted and in progress. Not a ticket. Poll getBooking.
+        CONFIRMED: Terminal. Ticket issued and payment captured.
+        FAILED: Terminal. No ticket issued and no charge made.
+
+    BookingFailureReason:
+      type: string
+      enum: [FARE_NO_LONGER_AVAILABLE, PAYMENT_DECLINED, FLIGHT_CANCELED]
+      description: Why a booking reached `FAILED`.
+
+    SearchStatus:
+      type: string
+      enum: [COMPLETE, PARTIAL]
+      description: |
+        Completeness of a flight search. Closed set.
+        - `COMPLETE` — Every inventory source answered. An empty `results` means no flights exist.
+        - `PARTIAL` — At least one source timed out. Retrying later may return more flights.
+      x-enum-descriptions:
+        COMPLETE: Every inventory source answered.
+        PARTIAL: At least one inventory source did not answer in time.
+
+    Flight:
+      type: object
+      required: [flight_id, flight_number, origin, dest, departs_at, arrives_at, seats_remaining, fare_class]
+      properties:
+        flight_id: { type: string, description: Stable identifier to pass to `createBooking`. }
+        flight_number: { type: string, examples: [AX1142] }
+        origin: { $ref: '#/components/schemas/AirportCode' }
+        dest: { $ref: '#/components/schemas/AirportCode' }
+        departs_at: { type: string, format: date-time }
+        arrives_at: { type: string, format: date-time }
+        seats_remaining: { type: integer, minimum: 0 }
+        fare_class: { type: string, examples: [Y] }
+
+    FlightSearchResult:
+      type: object
+      required: [search_status, results, next_cursor]
+      properties:
+        search_status: { $ref: '#/components/schemas/SearchStatus' }
+        results:
+          type: array
+          description: Always present. May be empty.
+          items: { $ref: '#/components/schemas/Flight' }
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null when this is the last page.
+
+    BookingRequest:
+      type: object
+      required: [flight_id, passenger_id]
+      properties:
+        flight_id: { type: string }
+        passenger_id: { type: string, description: The traveler's AirMiles member ID. }
+        seat: { type: string, description: Preferred seat, e.g. `12C`. Optional. }
+
+    Booking:
+      type: object
+      required: [booking_id, status, status_updated_at, confirmation_number, failure_reason, poll_after_seconds, flight_id]
+      properties:
+        booking_id: { type: string, pattern: '^BK-[0-9]+$' }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        status_updated_at: { type: string, format: date-time }
+        confirmation_number:
+          type: [string, 'null']
+          description: Record locator. Null unless `status` is `CONFIRMED`.
+        failure_reason:
+          description: Null unless `status` is `FAILED`.
+          oneOf:
+            - $ref: '#/components/schemas/BookingFailureReason'
+            - type: 'null'
+        poll_after_seconds:
+          type: [integer, 'null']
+          minimum: 1
+          description: Seconds to wait before polling again. Null when `status` is terminal.
+        flight_id: { type: string }
+
+    ErrorCode:
+      type: string
+      x-extensible-enum: [VALIDATION_FAILED, BOOKING_NOT_FOUND, RATE_LIMITED, SERVICE_UNAVAILABLE]
+      description: Machine-readable error identifier. Match on this, never on `message`.
+
+    Error:
+      type: object
+      required: [error_code, message, retryable, retry_after, remediation, correlation_id, request_id]
+      properties:
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        message: { type: string, description: Human-readable explanation for logs and end users. }
+        retryable: { type: boolean, description: True if repeating the same request may succeed. }
+        retry_after:
+          type: [integer, 'null']
+          minimum: 0
+          description: Seconds to wait before retrying. Null when `retryable` is false.
+        remediation:
+          type: [string, 'null']
+          description: What the caller should do next. Null when there is nothing to suggest.
+        correlation_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: The request is invalid. Not retryable without changes.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No booking exists with that ID.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Rate limit exceeded. Wait `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Temporarily unavailable. Retry after `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

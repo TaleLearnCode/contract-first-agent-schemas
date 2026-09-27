@@ -1,0 +1,75 @@
+# Governance pipeline from the talk:
+#   OpenAPI spec (source of truth) -> Spectral lint -> Contract tests -> Semantic diff -> Deploy | Block + Notify
+#
+# "Contracts have tests. Tests have pipelines. Pipelines have opinions."
+name: contract-governance
+
+on:
+  pull_request:
+    paths: ['schemas/**', 'governance/**', 'scripts/**']
+  push:
+    branches: [main]
+
+env:
+  SPECTRAL_VERSION: v6.15.0
+  OASDIFF_VERSION: 1.11.7
+
+jobs:
+  lint:
+    name: Spectral lint (naming & schema rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Spectral
+        shell: pwsh
+        run: |
+          $url = "https://github.com/stoplightio/spectral/releases/download/$env:SPECTRAL_VERSION/spectral-linux-x64"
+          Invoke-WebRequest -Uri $url -OutFile /usr/local/bin/spectral
+          chmod +x /usr/local/bin/spectral
+      - name: Lint contracts (after = must pass, before = must fail)
+        shell: pwsh
+        run: ./scripts/Invoke-ContractLint.ps1
+
+  semantic-diff:
+    name: Semantic diff (breaking change detection)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Install oasdiff
+        shell: pwsh
+        run: |
+          $url = "https://github.com/oasdiff/oasdiff/releases/download/v$env:OASDIFF_VERSION/oasdiff_$($env:OASDIFF_VERSION)_linux_amd64.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP/oasdiff.tar.gz"
+          tar -xzf "$env:RUNNER_TEMP/oasdiff.tar.gz" -C /usr/local/bin oasdiff
+      - name: Compare every AFTER contract with the base branch
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem schemas/*/after.openapi.yaml) {
+            $relative = "schemas/$($file.Directory.Name)/$($file.Name)"
+            git cat-file -e "origin/$($env:GITHUB_BASE_REF):$relative" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "New contract, nothing to diff: $relative"
+              continue
+            }
+            $baseCopy = Join-Path $env:RUNNER_TEMP 'base.yaml'
+            git show "origin/$($env:GITHUB_BASE_REF):$relative" | Set-Content -Path $baseCopy -Encoding utf8NoBOM
+            ./scripts/Test-BreakingChange.ps1 $baseCopy $relative
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          exit ([int] $failed)
+
+  # Consumer-driven contract tests (Pact) run here in a real provider repo:
+  # the provider verifies every pact that consumers (e.g. Brittany's agent team)
+  # have published to the Pact Broker before it is allowed to deploy.
+  #
+  # contract-tests:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: npm ci && npm run test:pact:provider
+  #       env:
+  #         PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
+  #         PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}

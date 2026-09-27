@@ -1,0 +1,2 @@
+# Default ruleset for `spectral lint` run from the repo root.
+extends: ./governance/agent-ready.spectral.yaml

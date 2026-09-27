@@ -1,0 +1,234 @@
+openapi: 3.1.0
+info:
+  title: Apex Airways Seat Assignment API — Structured Error Schema (BEFORE)
+  version: 1.4.0
+  summary: Errors are freeform strings with no code, no retry guidance, and no next step.
+  description: |
+    BEFORE state for Principle 2 — "Your Error Is an Agent's Next Step."
+
+    This is the contract behind the Monday morning retry loop. Every error response
+    is `text/plain` with a sentence meant for a human:
+
+        Something went wrong. Please try again.
+
+    An agent receiving that body cannot tell whether the failure is transient or
+    terminal, how long to wait, or what to do instead. So it follows its generic
+    retry policy — six times — and then gives up.
+
+    Compare with `after.openapi.yaml` in this folder. The two files differ only in
+    error handling; status enums, idempotency, and tracing are identical.
+
+    Apex Airways is a fictional airline used in the talk
+    "Contract-First APIs in the Age of Agents."
+  contact:
+    name: Apex Airways API Platform Team
+    url: https://developer.apex-airways.example
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.apex-airways.example/v1
+security:
+  - agentOAuth: [bookings:write]
+tags:
+  - name: Seats
+    description: View seat maps and assign seats on confirmed bookings.
+
+paths:
+  /bookings/{bookingId}/seat-map:
+    get:
+      operationId: getSeatMap
+      tags: [Seats]
+      summary: List the seats that can be assigned on a booking's flight
+      description: |
+        Returns every seat on the booked flight with its availability for this traveler.
+        Call this to choose a seat before `assignSeat`. If something goes wrong, an
+        error message is returned in the response body.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      responses:
+        '200':
+          description: Seat map for the booked flight.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeatMap' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/GenericError' }
+        '500': { $ref: '#/components/responses/GenericError' }
+        '503': { $ref: '#/components/responses/GenericError' }
+
+  /bookings/{bookingId}/seat:
+    put:
+      operationId: assignSeat
+      tags: [Seats]
+      summary: Assign a specific seat to a confirmed booking
+      description: |
+        Assigns the requested seat to the traveler on a `CONFIRMED` booking. Replaces any
+        previously assigned seat. If the request fails, an error message is returned;
+        please try again.
+
+        This endpoint is idempotent when an `Idempotency-Key` header is provided.
+        Clients should generate a UUID per seat request and reuse it on retry.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SeatAssignmentRequest' }
+            example: { seat: 12C }
+      responses:
+        '200':
+          description: Seat assigned.
+          headers:
+            Idempotency-Key: { $ref: '#/components/headers/Idempotency-Key' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeatAssignment' }
+              example:
+                booking_id: BK-99182
+                seat: 12C
+                status: ASSIGNED
+        '400': { $ref: '#/components/responses/GenericError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/GenericError' }
+        '429': { $ref: '#/components/responses/GenericError' }
+        '500': { $ref: '#/components/responses/GenericError' }
+        '503': { $ref: '#/components/responses/GenericError' }
+
+components:
+  securitySchemes:
+    agentOAuth:
+      type: oauth2
+      description: |
+        OAuth 2.1 client credentials. Each agent receives its own client identity,
+        separate from the human traveler, so every call is attributable and revocable.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.apex-airways.example/oauth2/token
+          scopes:
+            bookings:read: Read bookings and seat maps.
+            bookings:write: Create and modify bookings and seats.
+
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      description: The `booking_id` of a booking.
+      schema: { type: string, pattern: '^BK-[0-9]+$' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying this attempt. Reuse the same value on retries.
+      schema: { type: string, format: uuid }
+    CorrelationIdRequest:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Correlation ID of the caller's workflow. If omitted, the server generates one.
+      schema: { type: string, format: uuid }
+    TraceParentRequest:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context `traceparent` header.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Idempotency-Key:
+      description: Echo of the `Idempotency-Key` supplied on the request.
+      schema: { type: string, format: uuid }
+    X-Correlation-ID:
+      description: Shared by every call in one end-to-end workflow. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    X-Request-ID:
+      description: Unique to this single call. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    traceparent:
+      description: W3C Trace Context for this call. Always present.
+      required: true
+      schema: { type: string }
+
+  schemas:
+    SeatAssignmentRequest:
+      type: object
+      required: [seat]
+      properties:
+        seat:
+          type: string
+          pattern: '^[0-9]{1,2}[A-K]$'
+          description: Seat identifier from `getSeatMap`, e.g. `12C`.
+
+    SeatAssignment:
+      type: object
+      required: [booking_id, seat, status]
+      properties:
+        booking_id: { type: string }
+        seat: { type: string }
+        status:
+          type: string
+          enum: [ASSIGNED]
+          description: "`ASSIGNED` — the seat is held for this traveler."
+
+    Seat:
+      type: object
+      required: [seat, availability, cabin]
+      properties:
+        seat: { type: string, examples: [5A] }
+        cabin: { type: string, enum: [FIRST, ECONOMY_PLUS, ECONOMY] }
+        availability:
+          type: string
+          enum: [AVAILABLE, OCCUPIED, BLOCKED]
+          description: |
+            - `AVAILABLE` — can be assigned now.
+            - `OCCUPIED` — assigned to another passenger.
+            - `BLOCKED` — held by the airline (crew, weight and balance, accessibility).
+
+    SeatMap:
+      type: object
+      required: [booking_id, seats]
+      properties:
+        booking_id: { type: string }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/Seat' }
+
+  responses:
+    NotFound:
+      description: Not found.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        text/plain:
+          schema: { type: string }
+          example: Booking not found.
+    GenericError:
+      description: Error.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        text/plain:
+          schema: { type: string }
+          example: Something went wrong. Please try again.

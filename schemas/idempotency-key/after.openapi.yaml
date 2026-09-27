@@ -1,0 +1,347 @@
+openapi: 3.1.0
+info:
+  title: Apex Airways Booking API — Idempotency-Key Header (AFTER)
+  version: 2.0.0
+  summary: Retrying a booking is safe, and the contract says so.
+  description: |
+    AFTER state for Principle 3 — "Agents Will Retry. Make It Safe."
+
+    `POST /bookings` requires an `Idempotency-Key` header. The client generates a UUID
+    before the first attempt and sends the same value on every retry of that attempt.
+    The server stores the outcome keyed by (OAuth client, key) for 24 hours and
+    returns the stored response to any retry instead of creating a second booking.
+
+    The guarantee lives in three places consumers can see:
+    1. The operation `description` (what humans and agents read).
+    2. The `Idempotency-Key` parameter definition (what SDK generators and gateways read).
+    3. The `x-idempotency` extension (what linters and middleware can enforce).
+
+    The header follows the IETF HTTPAPI working group draft
+    "The Idempotency-Key HTTP Header Field".
+
+    Compare with `before.openapi.yaml` in this folder. The two files differ only in
+    idempotency; status enums, errors, and tracing are identical.
+
+    Apex Airways is a fictional airline used in the talk
+    "Contract-First APIs in the Age of Agents."
+  contact:
+    name: Apex Airways API Platform Team
+    url: https://developer.apex-airways.example
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.apex-airways.example/v2
+security:
+  - agentOAuth: [bookings:write]
+tags:
+  - name: Bookings
+    description: Create bookings safely under retries.
+
+paths:
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Request a booking for a flight (idempotent, asynchronous)
+      description: |
+        Requests a booking for one passenger on one flight and returns `202 Accepted`
+        with a `Booking` whose `status` is `PENDING` or `CONFIRMED`. Poll `getBooking`
+        until the status is terminal.
+
+        This endpoint is idempotent when an `Idempotency-Key` header is provided, and the
+        header is required. Clients should generate a UUID per request and reuse it on
+        retry. Generate the key before the first attempt, persist it with your pending
+        work, and send the identical key and identical body on every retry after a
+        timeout, connection reset, 429, or 5xx.
+
+        Server guarantees, for 24 hours after the first request with a given key:
+        - Same key, same body, first request finished → the original status code and
+          body are returned, with `Idempotent-Replayed: true` and
+          `idempotency.replayed: true`. No second booking. No second charge.
+        - Same key, same body, first request still running → `409` with
+          `IDEMPOTENCY_KEY_IN_PROGRESS` and `retryable: true`. Wait and retry.
+        - Same key, different body → `422` with `IDEMPOTENCY_KEY_REUSED` and
+          `retryable: false`. This is a client bug: a new booking needs a new key.
+        - 429 and 5xx outcomes are not stored, so retrying with the same key
+          re-attempts the operation safely.
+
+        Use a new key only when you intend a new, separate booking.
+      x-idempotency:
+        header: Idempotency-Key
+        required: true
+        scope: oauth-client
+        retention: PT24H
+        fingerprint: [method, path, body]
+        replayed-header: Idempotent-Replayed
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+            example:
+              flight_id: FL-AX1142-20261005
+              passenger_id: AM-4471902
+              seat: 12C
+      responses:
+        '202':
+          description: |
+            Booking accepted. Returned for the first request and, byte-for-byte identical
+            apart from the replay indicators and `X-Request-ID`, for every replay.
+          headers:
+            Location:
+              description: URL of the booking resource to poll.
+              schema: { type: string, format: uri-reference }
+            Idempotency-Key: { $ref: '#/components/headers/Idempotency-Key' }
+            Idempotent-Replayed: { $ref: '#/components/headers/Idempotent-Replayed' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                firstAttempt:
+                  summary: Saturday night, attempt 1 (response lost to a timeout)
+                  value:
+                    booking_id: BK-99182
+                    status: PENDING
+                    confirmation_number: null
+                    flight_id: FL-AX1142-20261005
+                    idempotency:
+                      key: 550e8400-e29b-41d4-a716-446655440000
+                      replayed: false
+                      first_seen_at: '2026-10-03T23:41:07Z'
+                retryReplay:
+                  summary: Saturday night, attempt 2 — same key, original booking returned
+                  value:
+                    booking_id: BK-99182
+                    status: PENDING
+                    confirmation_number: null
+                    flight_id: FL-AX1142-20261005
+                    idempotency:
+                      key: 550e8400-e29b-41d4-a716-446655440000
+                      replayed: true
+                      first_seen_at: '2026-10-03T23:41:07Z'
+        '400':
+          description: Missing or malformed `Idempotency-Key`, or invalid body. Not retryable without changes.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error_code: IDEMPOTENCY_KEY_MISSING
+                message: POST /bookings requires an Idempotency-Key header containing a UUID.
+                retryable: false
+                retry_after: null
+                remediation: Generate a UUID, send it as Idempotency-Key, and reuse it on retries.
+                correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                request_id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+        '409':
+          description: A request with this key is still being processed. Retry after `Retry-After` seconds.
+          headers:
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error_code: IDEMPOTENCY_KEY_IN_PROGRESS
+                message: The original request with this Idempotency-Key has not finished yet.
+                retryable: true
+                retry_after: 2
+                remediation: Wait 2 seconds and retry with the same Idempotency-Key and body.
+                correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                request_id: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e
+        '422':
+          description: This key was already used with a different request body. Not retryable.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error_code: IDEMPOTENCY_KEY_REUSED
+                message: This Idempotency-Key was first used with a different request body.
+                retryable: false
+                retry_after: null
+                remediation: If this is a new booking, generate a new Idempotency-Key. If it is a retry, resend the original body.
+                correlation_id: 7d2c9a4e-1b3f-4c8e-9f60-2a1d5e8b7c01
+                request_id: 3c4d5e6f-7a8b-4c9d-0e1f-2a3b4c5d6e7f
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+components:
+  securitySchemes:
+    agentOAuth:
+      type: oauth2
+      description: |
+        OAuth 2.1 client credentials. Each agent receives its own client identity,
+        separate from the human traveler, so every call is attributable and revocable.
+        Idempotency keys are scoped to this client identity.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.apex-airways.example/oauth2/token
+          scopes:
+            bookings:write: Create and modify bookings.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-generated UUID (v4 or v7) that identifies one logical operation.
+        Generate it once, before the first attempt. Send the same value on every retry
+        of that operation. Keys are scoped to your OAuth client and retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 550e8400-e29b-41d4-a716-446655440000
+    CorrelationIdRequest:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Correlation ID of the caller's workflow. If omitted, the server generates one.
+      schema: { type: string, format: uuid }
+    TraceParentRequest:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context `traceparent` header.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Idempotency-Key:
+      description: Echo of the `Idempotency-Key` supplied on the request. Always present on 2xx responses.
+      required: true
+      schema: { type: string, format: uuid }
+    Idempotent-Replayed:
+      description: "`true` when this response is a stored replay of an earlier request with the same key."
+      required: true
+      schema: { type: boolean }
+    X-Correlation-ID:
+      description: Shared by every call in one end-to-end workflow. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    X-Request-ID:
+      description: Unique to this single call, including replays. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    traceparent:
+      description: W3C Trace Context for this call. Always present.
+      required: true
+      schema: { type: string }
+    Retry-After:
+      description: Seconds to wait before retrying.
+      required: true
+      schema: { type: integer, minimum: 0 }
+
+  schemas:
+    BookingRequest:
+      type: object
+      required: [flight_id, passenger_id]
+      properties:
+        flight_id: { type: string }
+        passenger_id: { type: string, description: The traveler's AirMiles member ID. }
+        seat: { type: string, description: Preferred seat, e.g. `12C`. Optional. }
+
+    BookingStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, FAILED]
+      description: |
+        - `PENDING` — Accepted and in progress. NOT a ticket. Poll `getBooking`.
+        - `CONFIRMED` — Terminal. Ticket issued, payment captured.
+        - `FAILED` — Terminal. No ticket, no charge.
+
+    IdempotencyInfo:
+      type: object
+      description: Body-level echo of the idempotency outcome, for consumers that only see the body.
+      required: [key, replayed, first_seen_at]
+      properties:
+        key:
+          type: string
+          format: uuid
+          description: The `Idempotency-Key` this response is stored under.
+        replayed:
+          type: boolean
+          description: |
+            `false` on the request that created the booking; `true` on every replay.
+            A replay never creates a booking or a charge.
+        first_seen_at:
+          type: string
+          format: date-time
+          description: When the server first received this key.
+
+    Booking:
+      type: object
+      required: [booking_id, status, confirmation_number, flight_id, idempotency]
+      properties:
+        booking_id: { type: string, pattern: '^BK-[0-9]+$' }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        confirmation_number:
+          type: [string, 'null']
+          description: Record locator. Null unless `status` is `CONFIRMED`.
+        flight_id: { type: string }
+        idempotency: { $ref: '#/components/schemas/IdempotencyInfo' }
+
+    ErrorCode:
+      type: string
+      x-extensible-enum:
+        - VALIDATION_FAILED
+        - IDEMPOTENCY_KEY_MISSING
+        - IDEMPOTENCY_KEY_IN_PROGRESS
+        - IDEMPOTENCY_KEY_REUSED
+        - RATE_LIMITED
+        - SERVICE_UNAVAILABLE
+      description: Machine-readable error identifier. Match on this, never on `message`.
+
+    Error:
+      type: object
+      required: [error_code, message, retryable, retry_after, remediation, correlation_id, request_id]
+      properties:
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        message: { type: string, description: Human-readable explanation for logs and end users. }
+        retryable: { type: boolean, description: True if repeating the same request (same key, same body) may succeed. }
+        retry_after:
+          type: [integer, 'null']
+          minimum: 0
+          description: Seconds to wait before retrying. Null when `retryable` is false.
+        remediation:
+          type: [string, 'null']
+          description: What the caller should do next. Null when there is nothing to suggest.
+        correlation_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+
+  responses:
+    RateLimited:
+      description: Rate limit exceeded. Not stored against the key; retry with the same key after `Retry-After`.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Temporarily unavailable. Not stored against the key; retry with the same key after `Retry-After`.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

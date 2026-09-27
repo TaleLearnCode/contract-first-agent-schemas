@@ -1,0 +1,149 @@
+# Agent-ready API style guide, expressed as code.
+#
+# "Design rules that live in a wiki get ignored. Design rules enforced at the
+#  gateway get followed. And design rules expressed in the contract get executed
+#  by every consumer, human and agent alike."
+#
+# Each rule maps to a principle from "Contract-First APIs in the Age of Agents".
+# Severity `error` fails CI. Run with:
+#   spectral lint -r governance/agent-ready.spectral.yaml schemas/**/after.openapi.yaml
+
+extends: [[spectral:oas, recommended]]
+
+rules:
+  # ---------------------------------------------------------------------------
+  # Principle 1 — Make the happy path boring
+  # ---------------------------------------------------------------------------
+  agent-status-must-be-enum:
+    description: Status fields must be closed enums, never freeform strings.
+    message: "Status field must declare a closed enum of allowed values, not a freeform string."
+    severity: error
+    given: "$..properties[?(@property == 'status' || @property.match(/_status$/))]"
+    then:
+      field: enum
+      function: truthy
+
+  agent-status-enum-values-documented:
+    description: Every status enum must explain what each value means in its description.
+    message: "Status enum needs a description that defines what each value means."
+    severity: error
+    given: "$..properties[?(@property == 'status' || @property.match(/_status$/))]"
+    then:
+      field: description
+      function: truthy
+
+  agent-pagination-cursor-name:
+    description: Paginated responses use `next_cursor` everywhere. Never `next_page`, `nextToken`, etc.
+    message: "Use 'next_cursor' for pagination, not '{{property}}'."
+    severity: error
+    given: "$..properties[?(@property.match(/^(next_page|nextPage|next_token|nextToken|page_token|continuation)$/))]"
+    then:
+      function: falsy
+
+  # ---------------------------------------------------------------------------
+  # Principle 2 — Your error is an agent's next step
+  # ---------------------------------------------------------------------------
+  agent-error-must-be-json:
+    description: 4xx/5xx responses must return a machine-readable JSON body.
+    message: "Error responses must use application/json (or application/problem+json), not freeform text."
+    severity: error
+    given: "$.paths[*][*].responses[?(@property.match(/^[45]/))]"
+    then:
+      field: content
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          anyOf:
+            - required: [application/json]
+            - required: [application/problem+json]
+
+  agent-error-schema-decision-fields:
+    description: Error bodies must carry error_code, message, retryable, retry_after, remediation, correlation_id, request_id.
+    message: "Error schema is missing required decision fields: {{error}}"
+    severity: error
+    given: "$.paths[*][*].responses[?(@property.match(/^[45]/))].content['application/json'].schema"
+    then:
+      field: required
+      function: schema
+      functionOptions:
+        schema:
+          type: array
+          allOf:
+            - contains: { const: error_code }
+            - contains: { const: message }
+            - contains: { const: retryable }
+            - contains: { const: retry_after }
+            - contains: { const: remediation }
+            - contains: { const: correlation_id }
+            - contains: { const: request_id }
+
+  agent-retry-after-on-throttle:
+    description: 429 and 503 responses must declare a Retry-After header so agents stop hammering.
+    message: "429/503 responses must declare a Retry-After response header."
+    severity: error
+    given: "$.paths[*][*].responses[?(@property == '429' || @property == '503')]"
+    then:
+      field: headers.Retry-After
+      function: truthy
+
+  # ---------------------------------------------------------------------------
+  # Principle 3 — Agents will retry. Make it safe.
+  # ---------------------------------------------------------------------------
+  agent-idempotency-key-on-side-effects:
+    description: POST, PUT, and PATCH operations must declare the Idempotency-Key header.
+    message: "Side-effecting operation must declare an 'Idempotency-Key' header parameter."
+    severity: error
+    given: "$.paths[*][post,put,patch]"
+    then:
+      field: parameters
+      function: schema
+      functionOptions:
+        schema:
+          type: array
+          contains:
+            type: object
+            required: [name, in]
+            properties:
+              name: { const: Idempotency-Key }
+              in: { const: header }
+
+  agent-idempotency-documented:
+    description: The idempotency guarantee must be stated in the operation description, where agents read it.
+    message: "Describe the idempotency guarantee in the operation description (mention 'idempotent' and 'Idempotency-Key')."
+    severity: error
+    given: "$.paths[*][post,put,patch].description"
+    then:
+      function: pattern
+      functionOptions:
+        match: "idempotent[\\s\\S]*Idempotency-Key"
+
+  # ---------------------------------------------------------------------------
+  # Principle 4 — Trace IDs are not optional
+  # ---------------------------------------------------------------------------
+  agent-trace-headers-on-every-response:
+    description: Every response (success and error) must declare X-Correlation-ID, X-Request-ID, and traceparent.
+    message: "Every response must declare X-Correlation-ID, X-Request-ID, and traceparent headers."
+    severity: error
+    given: "$.paths[*][*].responses[*]"
+    then:
+      field: headers
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          required: [X-Correlation-ID, X-Request-ID, traceparent]
+
+  # ---------------------------------------------------------------------------
+  # Designing for the agent consumer — descriptions are prompts
+  # ---------------------------------------------------------------------------
+  agent-operation-description-length:
+    description: Operation descriptions must be a real paragraph an intelligent-but-literal reader can act on.
+    message: "Operation description is too thin for an agent to act on (minimum 150 characters)."
+    severity: error
+    given: "$.paths[*][get,post,put,patch,delete]"
+    then:
+      field: description
+      function: length
+      functionOptions:
+        min: 150

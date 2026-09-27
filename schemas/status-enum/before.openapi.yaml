@@ -1,0 +1,367 @@
+openapi: 3.1.0
+info:
+  title: Apex Airways Booking API — Status Enum Pattern (BEFORE)
+  version: 1.4.0
+  summary: Freeform status strings, implicit nullability, inconsistent pagination.
+  description: |
+    BEFORE state for Principle 1 — "Make the Happy Path Boring."
+
+    This is the contract Brittany's agent integrated against. It is valid OpenAPI
+    and every example "works", but the success responses have more than one
+    interpretation:
+
+    - `status` is typed as a plain `string`, so `"ok"` could mean "results found",
+      "ran without errors", or "request received".
+    - `confirmation` is optional rather than nullable, so a missing key could be an
+      error, a not-yet-available value, or a field that was renamed.
+    - Pagination uses `next_page` here and `cursor` on other Apex endpoints.
+
+    Compare with `after.openapi.yaml` in this folder. The two files differ only in
+    the concerns covered by Principle 1; idempotency, errors, and tracing are already
+    in their agent-ready form so the diff isolates the status pattern.
+
+    Apex Airways is a fictional airline used in the talk
+    "Contract-First APIs in the Age of Agents."
+  contact:
+    name: Apex Airways API Platform Team
+    url: https://developer.apex-airways.example
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.apex-airways.example/v1
+security:
+  - agentOAuth: [bookings:read, bookings:write]
+tags:
+  - name: Flights
+    description: Search available flights.
+  - name: Bookings
+    description: Create and read bookings.
+
+paths:
+  /flights:
+    get:
+      operationId: searchFlights
+      tags: [Flights]
+      summary: Search for available flights between two airports
+      description: |
+        Returns flights that match the origin, destination, and date. Call this before
+        `createBooking` to obtain a `flight_id`, or after a `SEAT_UNAVAILABLE` error to
+        find alternatives (set `flexible=true` to include nearby dates and airports).
+        Returns `status` and a list of results. Use `next_page` to get more results.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+        - name: origin
+          in: query
+          required: true
+          description: IATA airport code of the departure airport, e.g. `ORD`.
+          schema: { $ref: '#/components/schemas/AirportCode' }
+        - name: dest
+          in: query
+          required: true
+          description: IATA airport code of the arrival airport, e.g. `ATL`.
+          schema: { $ref: '#/components/schemas/AirportCode' }
+        - name: date
+          in: query
+          required: true
+          description: Departure date in the origin airport's local time (ISO 8601).
+          schema: { type: string, format: date }
+        - name: flexible
+          in: query
+          required: false
+          description: When true, include flights one day either side and alternate airports.
+          schema: { type: boolean, default: false }
+        - name: page
+          in: query
+          required: false
+          description: Page token from `next_page`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightSearchResult' }
+              examples:
+                ok:
+                  summary: The Friday test run
+                  value:
+                    status: ok
+                    results:
+                      - flight_id: FL-AX1142-20261005
+                        flight_number: AX1142
+                        origin: ORD
+                        dest: ATL
+                        departs_at: '2026-10-05T07:10:00-05:00'
+                        arrives_at: '2026-10-05T10:02:00-04:00'
+                        seats_remaining: 4
+                        fare_class: Y
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Book a flight
+      description: |
+        Books one passenger on one flight and returns the booking with its `status`
+        and `confirmation`. Check `status` to see the result of the booking request.
+
+        This endpoint is idempotent when an `Idempotency-Key` header is provided.
+        Clients should generate a UUID per booking attempt and reuse it on every retry
+        of that attempt.
+      security:
+        - agentOAuth: [bookings:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+      responses:
+        '200':
+          description: OK
+          headers:
+            Idempotency-Key: { $ref: '#/components/headers/Idempotency-Key' }
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                ok:
+                  summary: Saturday night — what did "ok" mean?
+                  value:
+                    booking_id: BK-99182
+                    status: ok
+                    flight_id: FL-AX1142-20261005
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings/{bookingId}:
+    get:
+      operationId: getBooking
+      tags: [Bookings]
+      summary: Get a booking
+      description: |
+        Returns the booking identified by `bookingId`, including its current `status`
+        and, when available, its `confirmation` number. Use this to look up a booking
+        that was created with `createBooking`.
+      security:
+        - agentOAuth: [bookings:read]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationIdRequest'
+        - $ref: '#/components/parameters/TraceParentRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            traceparent: { $ref: '#/components/headers/traceparent' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                ok:
+                  value:
+                    booking_id: BK-99182
+                    status: ok
+                    confirmation: QX7P2M
+                    flight_id: FL-AX1142-20261005
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+components:
+  securitySchemes:
+    agentOAuth:
+      type: oauth2
+      description: |
+        OAuth 2.1 client credentials. Each agent receives its own client identity,
+        separate from the human traveler, so every call is attributable and revocable.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.apex-airways.example/oauth2/token
+          scopes:
+            bookings:read: Search flights and read bookings.
+            bookings:write: Create and modify bookings.
+
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      description: The `booking_id` returned by `createBooking`.
+      schema: { type: string, pattern: '^BK-[0-9]+$' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying this attempt. Reuse the same value on retries.
+      schema: { type: string, format: uuid }
+    CorrelationIdRequest:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Correlation ID of the caller's workflow. If omitted, the server generates one.
+      schema: { type: string, format: uuid }
+    TraceParentRequest:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context `traceparent` header.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Idempotency-Key:
+      description: Echo of the `Idempotency-Key` supplied on the request.
+      schema: { type: string, format: uuid }
+    X-Correlation-ID:
+      description: Shared by every call in one end-to-end workflow. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    X-Request-ID:
+      description: Unique to this single call. Always present.
+      required: true
+      schema: { type: string, format: uuid }
+    traceparent:
+      description: W3C Trace Context for this call. Always present.
+      required: true
+      schema: { type: string }
+    Retry-After:
+      description: Seconds to wait before retrying.
+      required: true
+      schema: { type: integer, minimum: 0 }
+
+  schemas:
+    AirportCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      examples: [ORD]
+
+    Flight:
+      type: object
+      required: [flight_id, flight_number, origin, dest, departs_at, arrives_at, seats_remaining, fare_class]
+      properties:
+        flight_id: { type: string, description: Stable identifier to pass to `createBooking`. }
+        flight_number: { type: string, examples: [AX1142] }
+        origin: { $ref: '#/components/schemas/AirportCode' }
+        dest: { $ref: '#/components/schemas/AirportCode' }
+        departs_at: { type: string, format: date-time }
+        arrives_at: { type: string, format: date-time }
+        seats_remaining: { type: integer, minimum: 0 }
+        fare_class: { type: string, examples: [Y] }
+
+    FlightSearchResult:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Status of the search.
+          examples: [ok]
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/Flight' }
+        next_page:
+          type: string
+          description: Token for the next page of results.
+
+    BookingRequest:
+      type: object
+      required: [flight_id, passenger_id]
+      properties:
+        flight_id: { type: string }
+        passenger_id: { type: string, description: The traveler's AirMiles member ID. }
+        seat: { type: string, description: Preferred seat, e.g. `12C`. Optional. }
+
+    Booking:
+      type: object
+      required: [booking_id, status]
+      properties:
+        booking_id: { type: string, pattern: '^BK-[0-9]+$' }
+        status:
+          type: string
+          description: Booking status.
+          examples: [ok]
+        confirmation:
+          type: string
+          description: Confirmation number.
+        flight_id: { type: string }
+
+    ErrorCode:
+      type: string
+      x-extensible-enum: [VALIDATION_FAILED, BOOKING_NOT_FOUND, RATE_LIMITED, SERVICE_UNAVAILABLE]
+      description: Machine-readable error identifier. Match on this, never on `message`.
+
+    Error:
+      type: object
+      required: [error_code, message, retryable, retry_after, remediation, correlation_id, request_id]
+      properties:
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        message: { type: string, description: Human-readable explanation for logs and end users. }
+        retryable: { type: boolean, description: True if repeating the same request may succeed. }
+        retry_after:
+          type: [integer, 'null']
+          minimum: 0
+          description: Seconds to wait before retrying. Null when `retryable` is false.
+        remediation:
+          type: [string, 'null']
+          description: What the caller should do next. Null when there is nothing to suggest.
+        correlation_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: The request is invalid. Not retryable without changes.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No booking exists with that ID.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Rate limit exceeded. Wait `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Temporarily unavailable. Retry after `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        X-Correlation-ID: { $ref: '#/components/headers/X-Correlation-ID' }
+        X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+        traceparent: { $ref: '#/components/headers/traceparent' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
